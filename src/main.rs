@@ -1,24 +1,24 @@
 use mio::{Events, Interest, Poll, Token, net};
 use std::error::Error;
-use std::io::{Write, Read, ErrorKind};
+use std::io::{self, Write, Read, ErrorKind};
 
 struct Connection {
     to_write: Vec<u8>,
     stream: net::TcpStream,
 }
 
-fn poll_1(select: &mut Poll, events: &mut Events, conns: &mut Vec<Connection>) 
+fn poll_1(select: &mut Poll, events: &mut Events, conns: &mut Vec<Option<Connection>>)
     -> std::io::Result<()> {
     select.poll(events, None)?;
-    assert!(!events.is_empty());
     for event in &*events {
         let Token(i) = event.token();
         match conns.get_mut(i) {
-            Some(conn) => {
+            Some(Some(conn)) => {
                 if !conn.to_write.is_empty() && event.is_writable() {
                     match conn.stream.write(&conn.to_write[..]) {
                         Err(ref e) if e.kind() == ErrorKind::WouldBlock => break,
                         Ok(len @ 1..=std::usize::MAX) => {
+                            conn.stream.flush()?;
                             println!("Written {} bytes to connection #{}.", len, i);
                             conn.to_write.drain(..len);
                         }
@@ -37,7 +37,7 @@ fn poll_1(select: &mut Poll, events: &mut Events, conns: &mut Vec<Connection>)
                             }
                             Ok(_) => {
                                 println!("Connection #{} is shut down.", i);
-                                conns.remove(i);
+                                conns[i].take();
                                 break;
                             }
                             Err(ref e) => panic!("Error in connection: {:?}", e),
@@ -45,6 +45,7 @@ fn poll_1(select: &mut Poll, events: &mut Events, conns: &mut Vec<Connection>)
                     }
                 }
             }
+            Some(None) => { println!("WARNING! Connection #{} is gone.", i); }
             None => { panic!("Connection #{} not found.", i); }
         }
         println!("Handled event. writable={}, readable={}", 
@@ -57,33 +58,22 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut poll = Poll::new()?;
     let mut events = Events::with_capacity(128);
 
-    let address: std::net::SocketAddr = "93.184.216.34:80".parse()?;
-    let stream = net::TcpStream::connect(address)?;
-    let mut conn1 = Connection { to_write: 
-        br"GET / HTTP/1.1
-Host: example.com
-Connection: close
+    let address: std::net::SocketAddr = "127.0.0.1:7878".parse()?;
 
-"
-        .to_vec(), stream, };
-    poll.registry().register(&mut conn1.stream, Token(0), 
-        Interest::READABLE|Interest::WRITABLE)?;
+    let mut conns = Vec::new();
+    new_connection(&mut poll, address, &mut conns,
+&br"echo GREEN connection kept alive and sleep 2 sec
+keepalive
+sleep 2
+echo GREEN connection slept 2 sec and exits
+exit".to_vec()
+    )?;
 
-    let stream = net::TcpStream::connect("127.0.0.1:80".parse().unwrap())?;
-    let mut conn2 = Connection { to_write: 
-        br"GET /index.htm HTTP/1.1
-Host: example.com
-Connection: close
+    new_connection(&mut poll, address,
+        &mut conns, &b"echo this is RED connection\nsleep 5\necho RED connection slept 5 sec"
+        .to_vec())?;
 
-"
-        .to_vec(), stream, };
-    poll.registry().register(&mut conn2.stream, Token(1), 
-        Interest::READABLE|Interest::WRITABLE)?;
-
-    let mut conns = Vec::from([conn1, conn2]);
-
-    while conns.len() > 0 {
-        //poll_1(&mut poll, &mut events, &mut conns)?;
+    while conns.iter().find(|x|x.is_some()).is_some() {
         if let Err(e) = poll_1(&mut poll, &mut events, &mut conns) {
             if e.kind() != ErrorKind::Interrupted {
                 panic!("Cannot poll selector: {}", e);
@@ -91,5 +81,18 @@ Connection: close
         }
     }
 
+    Ok(())
+}
+
+fn new_connection(poll: &mut Poll, addr: std::net::SocketAddr,
+                  conns: &mut Vec<Option<Connection>>, to_send: &[u8])
+     -> io::Result<()> {
+    let stream = net::TcpStream::connect(addr)?;
+    let mut conn = Connection { to_write: to_send.into(), stream, };
+
+    let token = Token(conns.len());
+    poll.registry().register(&mut conn.stream, token,
+        Interest::READABLE|Interest::WRITABLE)?;
+    conns.push(Some(conn));
     Ok(())
 }
