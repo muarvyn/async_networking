@@ -1,31 +1,51 @@
-use mio::{Events, Interest, Poll, Token, net};
+use mio::{Events, Interest, Token, net};
 use std::error::Error;
-use std::io::{self, Write, Read, ErrorKind};
-use std::rc::{Rc, Weak};
-use std::cell::RefCell;
+use std::io::{self, Write, Read, ErrorKind, IoSlice};
+use std::collections::*;
 
 struct Connection<T: h::Handler> {
-    to_write: Vec<u8>,
+    to_write: VecDeque<u8>,
     stream: net::TcpStream,
     handler: T,
 }
 
+use std::task::Poll;
+impl<T: h::Handler>  Connection<T> {
+    fn write_if_pending(&mut self) -> io::Result<Poll<()>> {
+        if self.to_write.is_empty() { return io::Result::Ok(Poll::Ready(())) }
+
+        let (first, second) = self.to_write.as_slices();
+        match self.stream.write_vectored(&[IoSlice::new(first), IoSlice::new(second)]) {
+            Err(ref e) if e.kind() == ErrorKind::WouldBlock => Ok(Poll::Pending),
+            Ok(len @ 1..=std::usize::MAX) => {
+                self.stream.flush()?;
+                //println!("Written {} bytes to connection #{}.", len);
+                self.to_write.drain(..len);
+                if self.to_write.is_empty() {
+                    io::Result::Ok(Poll::Ready(()))
+                }
+                else {
+                    io::Result::Ok(Poll::Pending)
+                }
+            }
+            Err(e) => io::Result::Err(e),
+            _ => io::Result::Ok(Poll::Pending)
+        }
+    }
+}
+
 mod h {
-    use std::rc::Weak;
-    use std::cell::RefCell;
+    use std::io::Write;
 
     pub trait Handler {
-        fn handle(&mut self, received: &[u8], len: usize);
+        fn handle(&mut self, received: &[u8], len: usize, stream: impl Write);
     }
 
     pub enum HandlerState {}
 
-    pub struct SomeHandler {
-        pub conn: Weak<RefCell<crate::Connection<Self>>>,
-    }
-
+    pub struct SomeHandler;
     impl Handler for SomeHandler {
-        fn handle(&mut self, received: &[u8], len: usize) {
+        fn handle(&mut self, received: &[u8], len: usize, stream: impl Write) {
             println!("Received from connection: {}",
                      String::from_utf8_lossy(&received[..len]));
         }
@@ -34,27 +54,17 @@ mod h {
 
 use h::Handler;
 type Client1 = Connection<h::SomeHandler>;
-type Connections = Vec<Option<Rc<RefCell<Client1>>>>;
+type Connections = Vec<Option<Client1>>;
 
-fn poll_1(select: &mut Poll, events: &mut Events, conns: &mut Connections)
+fn poll_1(select: &mut mio::Poll, events: &mut Events, conns: &mut Connections)
     -> std::io::Result<()> {
     select.poll(events, None)?;
     for event in &*events {
         let Token(i) = event.token();
         match conns.get_mut(i) {
             Some(Some(conn)) => {
-                let mut conn = conn.borrow_mut();
-                if !conn.to_write.is_empty() && event.is_writable() {
-                    match conn.stream.write(&conn.to_write[..]) {
-                        Err(ref e) if e.kind() == ErrorKind::WouldBlock => break,
-                        Ok(len @ 1..=std::usize::MAX) => {
-                            conn.stream.flush()?;
-                            println!("Written {} bytes to connection #{}.", len, i);
-                            conn.to_write.drain(..len);
-                        }
-                        Err(ref e) => panic!("Error in connection #{}:\n{:?}", i, e),
-                        _ => {}
-                    }
+                if event.is_writable() {
+                    let _ = conn.write_if_pending()?;
                 }
                 if event.is_readable() {
                     loop {
@@ -62,9 +72,7 @@ fn poll_1(select: &mut Poll, events: &mut Events, conns: &mut Connections)
                         match conn.stream.read(&mut buffer) {
                             Err(ref e) if e.kind() == ErrorKind::WouldBlock => break,
                             Ok(len) if len > 0 => {
-                                //println!("Received from connection #{}:\n{}", 
-                                //    i, String::from_utf8_lossy(&buffer));
-                                conn.handler.handle(&buffer, len);
+                                conn.handler.handle(&buffer, len, &conn.stream);
                             }
                             Ok(_) => {
                                 println!("Connection #{} is shut down.", i);
@@ -86,7 +94,7 @@ fn poll_1(select: &mut Poll, events: &mut Events, conns: &mut Connections)
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
-    let mut poll = Poll::new()?;
+    let mut poll = mio::Poll::new()?;
     let mut events = Events::with_capacity(128);
 
     let address: std::net::SocketAddr = "127.0.0.1:7878".parse()?;
@@ -116,20 +124,18 @@ exit".to_vec()
     Ok(())
 }
 
-fn new_connection(poll: &mut Poll, addr: std::net::SocketAddr,
+fn new_connection(poll: &mut mio::Poll, addr: std::net::SocketAddr,
                   conns: &mut Connections, to_send: &[u8])
      -> io::Result<()> {
     let stream = net::TcpStream::connect(addr)?;
     let mut conn =
-        Client1 { to_write: to_send.into(), stream,
-                  handler: h::SomeHandler{conn:Weak::new()}};
+        Client1 { to_write: VecDeque::new(), stream, handler: h::SomeHandler};
+    conn.to_write.extend(to_send);
 
     let token = Token(conns.len());
     poll.registry().register(&mut conn.stream, token,
         Interest::READABLE|Interest::WRITABLE)?;
 
-    let conn = Rc::new(RefCell::new(conn));
-    conn.borrow().handler.conn = Rc::downgrade(&conn);
     conns.push(Some(conn));
     Ok(())
 }

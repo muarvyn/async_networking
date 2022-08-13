@@ -7,4 +7,3 @@ edition = "2021"
 
 [dependencies]
 mio = { version = "0", features = ["net", "os-poll"] }
-#std = { features = ["rust1"] }
