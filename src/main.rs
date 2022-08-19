@@ -3,16 +3,16 @@ use std::error::Error;
 use std::io::{self, Write, Read, ErrorKind, IoSlice};
 use std::collections::*;
 
-struct Connection<T: h::Handler> {
+pub struct Connection {
     to_write: VecDeque<u8>,
     stream: net::TcpStream,
-    handler: T,
+    handler: Option<Box<dyn h::Handler>>,
 }
 
 use std::task::Poll;
-impl<T: h::Handler>  Connection<T> {
-    fn write_if_pending(&mut self) -> io::Result<Poll<()>> {
-        if self.to_write.is_empty() { return io::Result::Ok(Poll::Ready(())) }
+impl Connection {
+    pub fn write_if_pending(&mut self) -> io::Result<Poll<()>> {
+        if self.to_write.is_empty() { return Ok(Poll::Ready(())) }
 
         let (first, second) = self.to_write.as_slices();
         match self.stream.write_vectored(&[IoSlice::new(first), IoSlice::new(second)]) {
@@ -22,73 +22,112 @@ impl<T: h::Handler>  Connection<T> {
                 //println!("Written {} bytes to connection #{}.", len);
                 self.to_write.drain(..len);
                 if self.to_write.is_empty() {
-                    io::Result::Ok(Poll::Ready(()))
+                    self.stream.flush()?;
+                    Ok(Poll::Ready(()))
                 }
                 else {
-                    io::Result::Ok(Poll::Pending)
+                    Ok(Poll::Pending)
                 }
             }
             Err(e) => io::Result::Err(e),
-            _ => io::Result::Ok(Poll::Pending)
+            _ => Ok(Poll::Pending)
         }
+    }
+
+    pub fn append_to_write(&mut self, to_write: &[u8]) {
+        self.to_write.extend(to_write);
     }
 }
 
 mod h {
-    use std::io::Write;
-
     pub trait Handler {
-        fn handle(&mut self, received: &[u8], len: usize, stream: impl Write);
+        fn handle(self: Box<Self>, received: &[u8], len: usize, stream: &mut crate::Connection)
+            -> Box<dyn Handler>;
     }
 
-    pub enum HandlerState {}
+    pub struct InitialHandler {}
 
-    pub struct SomeHandler;
-    impl Handler for SomeHandler {
-        fn handle(&mut self, received: &[u8], len: usize, stream: impl Write) {
-            println!("Received from connection: {}",
-                     String::from_utf8_lossy(&received[..len]));
+    pub struct ForwardHandler {
+        name: String,
+        count: usize,
+    }
+
+    impl Handler for InitialHandler {
+        fn handle(self: Box<Self>, received: &[u8], len: usize, stream: &mut crate::Connection)
+            -> Box<dyn Handler> {
+//            println!("Received from connection: {}",
+//                     String::from_utf8_lossy(&received[..len]));
+            let buffer = String::from_utf8_lossy(&received[..len]);
+            let (command, args) = crate::split_command(&buffer);
+            match command {
+                "name" => {
+                    let name = args.to_string();
+                    println!("Connection {} is opened.", name);
+                    Box::new(ForwardHandler { name, count: 1, })
+                }
+                "" => self,
+                _ => {
+                    eprintln!("Error: command 'name' expected first.");
+                    //stream.append_to_write(b"echo Error: command 'name' expected first.");
+                    self
+                }
+            }
+        }
+    }
+
+    impl Handler for ForwardHandler {
+        fn handle(self: Box<Self>, received: &[u8], len: usize, stream: &mut crate::Connection)
+            -> Box<dyn Handler> {
+            let buffer = String::from_utf8_lossy(&received[..len]);
+            println!("Connection {}. Received message #{}:'{}'",
+                     self.name.as_str(), self.count, buffer);
+            Box::new(ForwardHandler { name: self.name, count: self.count+1, })
         }
     }
 } // mod h
 
-use h::Handler;
-type Client1 = Connection<h::SomeHandler>;
-type Connections = Vec<Option<Client1>>;
+type Connections = Vec<Option<Connection>>;
 
 fn poll_1(select: &mut mio::Poll, events: &mut Events, conns: &mut Connections)
     -> std::io::Result<()> {
     select.poll(events, None)?;
     for event in &*events {
         let Token(i) = event.token();
+        let mut shutdown = false;
         match conns.get_mut(i) {
-            Some(Some(conn)) => {
-                if event.is_writable() {
-                    let _ = conn.write_if_pending()?;
-                }
+            Some(Some(ref mut conn)) => {
                 if event.is_readable() {
                     loop {
                         let mut buffer = [0u8; 2048];
                         match conn.stream.read(&mut buffer) {
                             Err(ref e) if e.kind() == ErrorKind::WouldBlock => break,
                             Ok(len) if len > 0 => {
-                                conn.handler.handle(&buffer, len, &conn.stream);
+                                let handler = conn.handler.take().unwrap();
+                                conn.handler = Some(
+                                    handler.handle(&buffer, len, conn)
+                                    );
                             }
                             Ok(_) => {
-                                println!("Connection #{} is shut down.", i);
-                                conns[i].take();
+                                shutdown = true;
                                 break;
                             }
                             Err(ref e) => panic!("Error in connection: {:?}", e),
                         }
                     }
                 }
+                if event.is_writable() {
+                    let _ = conn.write_if_pending()?;
+                }
+                if shutdown {
+                    println!("Connection #{} is shut down.", i);
+                    drop(conns[i].take());
+                }
             }
             Some(None) => { println!("WARNING! Connection #{} is gone.", i); }
             None => { panic!("Connection #{} not found.", i); }
         }
-        println!("Handled event. writable={}, readable={}",
-            event.is_writable(), event.is_readable());
+//        println!("Handled event. writable={}, readable={}",
+//            event.is_writable(), event.is_readable());
     }
     Ok(())
 }
@@ -101,16 +140,17 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     let mut conns = Vec::new();
     new_connection(&mut poll, address, &mut conns,
-&br"echo GREEN connection kept alive and sleep 2 sec
+&br"echo name GREEN
+echo will keepalive and sleep for 2 sec
 keepalive
 sleep 2
-echo GREEN connection slept 2 sec and exits
+echo Slept 2 sec and will exit
 exit".to_vec()
     )?;
 
     new_connection(&mut poll, address,
         &mut conns,
-        &b"echo this is RED connection\nsleep 5\necho RED connection slept 5 sec"
+        &b"echo name RED\necho will sleep 5 sec\nsleep 5\necho Slept 5 sec"
         .to_vec())?;
 
     while conns.iter().find(|x|x.is_some()).is_some() {
@@ -129,7 +169,9 @@ fn new_connection(poll: &mut mio::Poll, addr: std::net::SocketAddr,
      -> io::Result<()> {
     let stream = net::TcpStream::connect(addr)?;
     let mut conn =
-        Client1 { to_write: VecDeque::new(), stream, handler: h::SomeHandler};
+        Connection { to_write: VecDeque::new(), stream,
+                     handler: Some(Box::new(h::InitialHandler{}))
+                   };
     conn.to_write.extend(to_send);
 
     let token = Token(conns.len());
@@ -138,4 +180,9 @@ fn new_connection(poll: &mut mio::Poll, addr: std::net::SocketAddr,
 
     conns.push(Some(conn));
     Ok(())
+}
+
+fn split_command(s: &str) -> (&str, &str) {
+    let s = s.trim_matches(char::from(0)).trim();
+    s.split_at(s.find(" ").unwrap_or(s.len()))
 }
