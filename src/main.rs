@@ -6,7 +6,7 @@ use std::collections::*;
 pub struct Connection {
     to_write: VecDeque<u8>,
     stream: net::TcpStream,
-    handler: Option<Box<dyn h::Handler>>,
+    handler: CommonHandler,
 }
 
 use std::task::Poll;
@@ -39,9 +39,23 @@ impl Connection {
     }
 }
 
+pub struct CommonHandler {
+    state: Option<Box<dyn h::Handler>>,
+}
+
+impl CommonHandler {
+    pub fn process(&mut self, received: &[u8], len: usize) {
+        let buffer = String::from_utf8_lossy(&received[..len]);
+        for commandline in buffer.lines() {
+            let handler = self.state.take().unwrap();
+            self.state = Some(handler.handle(commandline));
+        }
+    }
+}
+
 mod h {
     pub trait Handler {
-        fn handle(self: Box<Self>, received: &[u8], len: usize, stream: &mut crate::Connection)
+        fn handle(self: Box<Self>, received: &str)
             -> Box<dyn Handler>;
     }
 
@@ -53,12 +67,9 @@ mod h {
     }
 
     impl Handler for InitialHandler {
-        fn handle(self: Box<Self>, received: &[u8], len: usize, stream: &mut crate::Connection)
+        fn handle(self: Box<Self>, received: &str)
             -> Box<dyn Handler> {
-//            println!("Received from connection: {}",
-//                     String::from_utf8_lossy(&received[..len]));
-            let buffer = String::from_utf8_lossy(&received[..len]);
-            let (command, args) = crate::split_command(&buffer);
+            let (command, args) = crate::split_command(received);
             match command {
                 "name" => {
                     let name = args.to_string();
@@ -76,11 +87,10 @@ mod h {
     }
 
     impl Handler for ForwardHandler {
-        fn handle(self: Box<Self>, received: &[u8], len: usize, stream: &mut crate::Connection)
+        fn handle(self: Box<Self>, received: &str)
             -> Box<dyn Handler> {
-            let buffer = String::from_utf8_lossy(&received[..len]);
             println!("Connection {}. Received message #{}:'{}'",
-                     self.name.as_str(), self.count, buffer);
+                     self.name.as_str(), self.count, received);
             Box::new(ForwardHandler { name: self.name, count: self.count+1, })
         }
     }
@@ -101,12 +111,7 @@ fn poll_1(select: &mut mio::Poll, events: &mut Events, conns: &mut Connections)
                         let mut buffer = [0u8; 2048];
                         match conn.stream.read(&mut buffer) {
                             Err(ref e) if e.kind() == ErrorKind::WouldBlock => break,
-                            Ok(len) if len > 0 => {
-                                let handler = conn.handler.take().unwrap();
-                                conn.handler = Some(
-                                    handler.handle(&buffer, len, conn)
-                                    );
-                            }
+                            Ok(len) if len > 0 => conn.handler.process(&buffer, len),
                             Ok(_) => {
                                 shutdown = true;
                                 break;
@@ -115,7 +120,7 @@ fn poll_1(select: &mut mio::Poll, events: &mut Events, conns: &mut Connections)
                         }
                     }
                 }
-                if event.is_writable() {
+                if !shutdown && event.is_writable() {
                     let _ = conn.write_if_pending()?;
                 }
                 if shutdown {
@@ -170,7 +175,7 @@ fn new_connection(poll: &mut mio::Poll, addr: std::net::SocketAddr,
     let stream = net::TcpStream::connect(addr)?;
     let mut conn =
         Connection { to_write: VecDeque::new(), stream,
-                     handler: Some(Box::new(h::InitialHandler{}))
+                     handler: CommonHandler{ state: Some(Box::new(h::InitialHandler{})) }
                    };
     conn.to_write.extend(to_send);
 
