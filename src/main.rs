@@ -44,18 +44,20 @@ pub struct CommonHandler {
 }
 
 impl CommonHandler {
-    pub fn process(&mut self, received: &[u8], len: usize) {
+    pub fn process(&mut self, received: &[u8], len: usize, to_transmit: &dyn Write) {
         let buffer = String::from_utf8_lossy(&received[..len]);
         for commandline in buffer.lines() {
             let handler = self.state.take().unwrap();
-            self.state = Some(handler.handle(commandline));
+            self.state = Some(handler.handle(commandline, to_transmit));
         }
     }
 }
 
 mod h {
+    use std::io::Write;
+
     pub trait Handler {
-        fn handle(self: Box<Self>, received: &str)
+        fn handle(self: Box<Self>, received: &str, to_transmit: &dyn Write)
             -> Box<dyn Handler>;
     }
 
@@ -67,7 +69,7 @@ mod h {
     }
 
     impl Handler for InitialHandler {
-        fn handle(self: Box<Self>, received: &str)
+        fn handle(self: Box<Self>, received: &str, to_transmit: &dyn Write)
             -> Box<dyn Handler> {
             let (command, args) = crate::split_command(received);
             match command {
@@ -87,11 +89,12 @@ mod h {
     }
 
     impl Handler for ForwardHandler {
-        fn handle(self: Box<Self>, received: &str)
+        fn handle(mut self: Box<Self>, received: &str, to_transmit: &dyn Write)
             -> Box<dyn Handler> {
             println!("Connection {}. Received message #{}:'{}'",
                      self.name.as_str(), self.count, received);
-            Box::new(ForwardHandler { name: self.name, count: self.count+1, })
+            self.count += 1;
+            self
         }
     }
 } // mod h
@@ -111,7 +114,8 @@ fn poll_1(select: &mut mio::Poll, events: &mut Events, conns: &mut Connections)
                         let mut buffer = [0u8; 2048];
                         match conn.stream.read(&mut buffer) {
                             Err(ref e) if e.kind() == ErrorKind::WouldBlock => break,
-                            Ok(len) if len > 0 => conn.handler.process(&buffer, len),
+                            Ok(len) if len > 0 => 
+                                conn.handler.process(&buffer, len, &conn.to_write),
                             Ok(_) => {
                                 shutdown = true;
                                 break;
