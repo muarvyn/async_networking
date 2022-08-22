@@ -18,7 +18,6 @@ impl Connection {
         match self.stream.write_vectored(&[IoSlice::new(first), IoSlice::new(second)]) {
             Err(ref e) if e.kind() == ErrorKind::WouldBlock => Ok(Poll::Pending),
             Ok(len @ 1..=std::usize::MAX) => {
-                self.stream.flush()?;
                 //println!("Written {} bytes to connection #{}.", len);
                 self.to_write.drain(..len);
                 if self.to_write.is_empty() {
@@ -44,7 +43,7 @@ pub struct CommonHandler {
 }
 
 impl CommonHandler {
-    pub fn process(&mut self, received: &[u8], len: usize, to_transmit: &dyn Write) {
+    pub fn process(&mut self, received: &[u8], len: usize, to_transmit: &mut dyn Write) {
         let buffer = String::from_utf8_lossy(&received[..len]);
         for commandline in buffer.lines() {
             let handler = self.state.take().unwrap();
@@ -57,7 +56,7 @@ mod h {
     use std::io::Write;
 
     pub trait Handler {
-        fn handle(self: Box<Self>, received: &str, to_transmit: &dyn Write)
+        fn handle(self: Box<Self>, received: &str, to_transmit: &mut dyn Write)
             -> Box<dyn Handler>;
     }
 
@@ -69,7 +68,7 @@ mod h {
     }
 
     impl Handler for InitialHandler {
-        fn handle(self: Box<Self>, received: &str, to_transmit: &dyn Write)
+        fn handle(self: Box<Self>, received: &str, _to_transmit: &mut dyn Write)
             -> Box<dyn Handler> {
             let (command, args) = crate::split_command(received);
             match command {
@@ -81,7 +80,6 @@ mod h {
                 "" => self,
                 _ => {
                     eprintln!("Error: command 'name' expected first.");
-                    //stream.append_to_write(b"echo Error: command 'name' expected first.");
                     self
                 }
             }
@@ -89,10 +87,15 @@ mod h {
     }
 
     impl Handler for ForwardHandler {
-        fn handle(mut self: Box<Self>, received: &str, to_transmit: &dyn Write)
+        fn handle(mut self: Box<Self>, received: &str, to_transmit: &mut dyn Write)
             -> Box<dyn Handler> {
             println!("Connection {}. Received message #{}:'{}'",
                      self.name.as_str(), self.count, received);
+            if self.count == 2 {
+                let reply = format!("echo Hello from {} peer!\nexit\n", self.name);
+                to_transmit.write(reply.as_bytes())
+                    .expect("Unexpected error while write in VecDeque.");
+            }
             self.count += 1;
             self
         }
@@ -106,29 +109,14 @@ fn poll_1(select: &mut mio::Poll, events: &mut Events, conns: &mut Connections)
     select.poll(events, None)?;
     for event in &*events {
         let Token(i) = event.token();
-        let mut shutdown = false;
         match conns.get_mut(i) {
             Some(Some(ref mut conn)) => {
-                if event.is_readable() {
-                    loop {
-                        let mut buffer = [0u8; 2048];
-                        match conn.stream.read(&mut buffer) {
-                            Err(ref e) if e.kind() == ErrorKind::WouldBlock => break,
-                            Ok(len) if len > 0 => 
-                                conn.handler.process(&buffer, len, &conn.to_write),
-                            Ok(_) => {
-                                shutdown = true;
-                                break;
-                            }
-                            Err(ref e) => panic!("Error in connection: {:?}", e),
-                        }
-                    }
-                }
-                if !shutdown && event.is_writable() {
-                    let _ = conn.write_if_pending()?;
-                }
-                if shutdown {
+                if !handle_event(conn, &event) {
                     println!("Connection #{} is shut down.", i);
+                    if !conn.to_write.is_empty() {
+                        eprintln!("Pending {} bytes where not transmitted.",
+                                  conn.to_write.len());
+                    }
                     drop(conns[i].take());
                 }
             }
@@ -141,6 +129,32 @@ fn poll_1(select: &mut mio::Poll, events: &mut Events, conns: &mut Connections)
     Ok(())
 }
 
+fn handle_event(conn: &mut Connection, event: &mio::event::Event) -> bool {
+    if event.is_readable() {
+        loop {
+            let mut buffer = [0u8; 2048];
+            match conn.stream.read(&mut buffer) {
+                Err(ref e) if e.kind() == ErrorKind::WouldBlock => break,
+                Ok(len) if len > 0 =>
+                    conn.handler.process(&buffer, len, &mut conn.to_write),
+                Ok(_) => return false,
+                Err(e) => {
+                    eprintln!("Error in connection: {}", e.to_string());
+                    return false
+                }
+            }
+        }
+    }
+    if event.is_writable() {
+        if let Err(e) = conn.write_if_pending() {
+            eprintln!("Error in connection: {}", e.to_string());
+            return false
+        };
+    }
+    true
+}
+
+
 fn main() -> Result<(), Box<dyn Error>> {
     let mut poll = mio::Poll::new()?;
     let mut events = Events::with_capacity(128);
@@ -150,16 +164,17 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut conns = Vec::new();
     new_connection(&mut poll, address, &mut conns,
 &br"echo name GREEN
-echo will keepalive and sleep for 2 sec
+echo will sleep for 2 sec
 keepalive
 sleep 2
-echo Slept 2 sec and will exit
-exit".to_vec()
+echo Slept 2 sec
+"
+    .to_vec()
     )?;
 
     new_connection(&mut poll, address,
         &mut conns,
-        &b"echo name RED\necho will sleep 5 sec\nsleep 5\necho Slept 5 sec"
+        &b"echo name RED\necho will sleep 5 sec\nsleep 5\necho Slept 5 sec\nkeepalive\n"
         .to_vec())?;
 
     while conns.iter().find(|x|x.is_some()).is_some() {
