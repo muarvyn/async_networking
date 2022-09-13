@@ -104,9 +104,10 @@ mod h {
 
 type Connections = Vec<Option<Connection>>;
 
-fn poll_1(select: &mut mio::Poll, events: &mut Events, conns: &mut Connections)
+fn poll_1(events: &mut Events, conns: &mut Connections)
     -> std::io::Result<()> {
-    select.poll(events, None)?;
+    POLL.with(|poll|
+        poll.borrow_mut().poll(events, None))?;
     for event in &*events {
         let Token(i) = event.token();
         match conns.get_mut(i) {
@@ -154,15 +155,19 @@ fn handle_event(conn: &mut Connection, event: &mio::event::Event) -> bool {
     true
 }
 
+use std::cell::RefCell;
+
+thread_local! {
+    static POLL: RefCell<mio::Poll> = RefCell::new(mio::Poll::new().unwrap());
+}
 
 fn main() -> Result<(), Box<dyn Error>> {
-    let mut poll = mio::Poll::new()?;
     let mut events = Events::with_capacity(128);
 
     let address: std::net::SocketAddr = "127.0.0.1:7878".parse()?;
 
     let mut conns = Vec::new();
-    new_connection(&mut poll, address, &mut conns,
+    new_connection(address, &mut conns,
 &br"echo name GREEN
 echo will sleep for 2 sec
 keepalive
@@ -172,13 +177,13 @@ echo Slept 2 sec
     .to_vec()
     )?;
 
-    new_connection(&mut poll, address,
+    new_connection(address,
         &mut conns,
         &b"echo name RED\necho will sleep 5 sec\nsleep 5\necho Slept 5 sec\nkeepalive\n"
         .to_vec())?;
 
     while conns.iter().find(|x|x.is_some()).is_some() {
-        if let Err(e) = poll_1(&mut poll, &mut events, &mut conns) {
+        if let Err(e) = poll_1(&mut events, &mut conns) {
             if e.kind() != ErrorKind::Interrupted {
                 panic!("Cannot poll selector: {}", e);
             }
@@ -188,7 +193,7 @@ echo Slept 2 sec
     Ok(())
 }
 
-fn new_connection(poll: &mut mio::Poll, addr: std::net::SocketAddr,
+fn new_connection(addr: std::net::SocketAddr,
                   conns: &mut Connections, to_send: &[u8])
      -> io::Result<()> {
     let stream = net::TcpStream::connect(addr)?;
@@ -199,8 +204,9 @@ fn new_connection(poll: &mut mio::Poll, addr: std::net::SocketAddr,
     conn.to_write.extend(to_send);
 
     let token = Token(conns.len());
-    poll.registry().register(&mut conn.stream, token,
-        Interest::READABLE|Interest::WRITABLE)?;
+    POLL.with(|poll| poll.borrow_mut().registry()
+        .register(&mut conn.stream, token, Interest::READABLE|Interest::WRITABLE)
+    )?;
 
     conns.push(Some(conn));
     Ok(())
