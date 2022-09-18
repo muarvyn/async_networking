@@ -7,3 +7,4 @@ edition = "2021"
 
 [dependencies]
 mio = { version = "0", features = ["net", "os-poll"] }
+futures = "0.3"

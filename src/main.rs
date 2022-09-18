@@ -2,6 +2,8 @@ use mio::{Events, Interest, Token, net};
 use std::error::Error;
 use std::io::{self, Write, Read, ErrorKind, IoSlice};
 use std::collections::*;
+use futures::future::poll_fn;
+use futures::task::{waker_ref, ArcWake};
 
 pub struct Connection {
     to_write: VecDeque<u8>,
@@ -10,6 +12,8 @@ pub struct Connection {
 }
 
 use std::task::Poll;
+use std::future::Future;
+
 impl Connection {
     pub fn write_if_pending(&mut self) -> io::Result<Poll<()>> {
         if self.to_write.is_empty() { return Ok(Poll::Ready(())) }
@@ -36,6 +40,22 @@ impl Connection {
     pub fn append_to_write(&mut self, to_write: &[u8]) {
         self.to_write.extend(to_write);
     }
+
+    pub fn read<'a>(&'a mut self, buffer: &'a mut [u8])
+        -> impl Future<Output = io::Result<usize>> + 'a {
+        //let buffer_cell = RefCell::new(buffer);
+        //let mut written = 0 as usize;
+        poll_fn(|_context| {
+            //let mut arr = &mut *buffer_cell.borrow_mut();
+            //let (_allocated, free) = arr.split_at_mut(written);
+            match self.stream.read(buffer) {
+                Err(ref e) if e.kind() == ErrorKind::WouldBlock => Poll::Pending,
+                Ok(len) => Poll::Ready(Ok(len)),
+                Err(e) => Poll::Ready(Err(e)),
+            }
+        })
+    }
+
 }
 
 pub struct CommonHandler {
@@ -193,6 +213,41 @@ echo Slept 2 sec
     Ok(())
 }
 
+async fn interaction_1(conn: &mut Connection) -> io::Result<()> {
+    let mut buffer = [0u8; 2048];
+    let mut name = "unnamed".to_string();
+
+    'outer:
+    loop {
+        let len = conn.read(&mut buffer).await?;
+        let buffer = String::from_utf8_lossy(&buffer[..len]);
+        let mut it = buffer.lines();
+
+        while let Some(commandline) = it.next() {
+            if get_name(commandline, &mut name) { break 'outer };
+        }
+    }
+
+    loop {
+        let mut count = 1 as usize;
+        let len = conn.read(&mut buffer).await?;
+        if len == 0 { break }
+        let buffer = String::from_utf8_lossy(&buffer[..len]);
+        let mut it = buffer.lines();
+
+        while let Some(commandline) = it.next() {
+            println!("Connection {}. Received message #{}:'{}'", name.as_str(), count, commandline);
+            if count == 2 {
+                let reply = format!("echo Hello from {} peer!\nexit\n", name);
+                conn.append_to_write(reply.as_bytes());
+            }
+            count += 1;
+        }
+    }
+
+    Ok(())
+}
+
 fn new_connection(addr: std::net::SocketAddr,
                   conns: &mut Connections, to_send: &[u8])
      -> io::Result<()> {
@@ -215,4 +270,15 @@ fn new_connection(addr: std::net::SocketAddr,
 fn split_command(s: &str) -> (&str, &str) {
     let s = s.trim_matches(char::from(0)).trim();
     s.split_at(s.find(" ").unwrap_or(s.len()))
+}
+
+fn get_name(s: &str, name: &mut String) -> bool {
+    let (command, args) = crate::split_command(s);
+    match command {
+        "name" => {
+            name.replace_range(.., args);
+            true
+        }
+        _ => false,
+    }
 }
