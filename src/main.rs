@@ -5,16 +5,15 @@ use std::collections::*;
 use futures::future::poll_fn;
 use futures::task::{waker_ref, ArcWake};
 
-pub struct Connection {
+pub struct Session {
     to_write: VecDeque<u8>,
     stream: net::TcpStream,
-    handler: CommonHandler,
 }
 
-use std::task::Poll;
+use std::task::{Poll, Context};
 use std::future::Future;
 
-impl Connection {
+impl Session {
     pub fn write_if_pending(&mut self) -> io::Result<Poll<()>> {
         if self.to_write.is_empty() { return Ok(Poll::Ready(())) }
 
@@ -58,123 +57,6 @@ impl Connection {
 
 }
 
-pub struct CommonHandler {
-    state: Option<Box<dyn h::Handler>>,
-}
-
-impl CommonHandler {
-    pub fn process(&mut self, received: &[u8], len: usize, to_transmit: &mut dyn Write) {
-        let buffer = String::from_utf8_lossy(&received[..len]);
-        for commandline in buffer.lines() {
-            let handler = self.state.take().unwrap();
-            self.state = Some(handler.handle(commandline, to_transmit));
-        }
-    }
-}
-
-mod h {
-    use std::io::Write;
-
-    pub trait Handler {
-        fn handle(self: Box<Self>, received: &str, to_transmit: &mut dyn Write)
-            -> Box<dyn Handler>;
-    }
-
-    pub struct InitialHandler {}
-
-    pub struct ForwardHandler {
-        name: String,
-        count: usize,
-    }
-
-    impl Handler for InitialHandler {
-        fn handle(self: Box<Self>, received: &str, _to_transmit: &mut dyn Write)
-            -> Box<dyn Handler> {
-            let (command, args) = crate::split_command(received);
-            match command {
-                "name" => {
-                    let name = args.to_string();
-                    println!("Connection {} is opened.", name);
-                    Box::new(ForwardHandler { name, count: 1, })
-                }
-                "" => self,
-                _ => {
-                    eprintln!("Error: command 'name' expected first.");
-                    self
-                }
-            }
-        }
-    }
-
-    impl Handler for ForwardHandler {
-        fn handle(mut self: Box<Self>, received: &str, to_transmit: &mut dyn Write)
-            -> Box<dyn Handler> {
-            println!("Connection {}. Received message #{}:'{}'",
-                     self.name.as_str(), self.count, received);
-            if self.count == 2 {
-                let reply = format!("echo Hello from {} peer!\nexit\n", self.name);
-                to_transmit.write(reply.as_bytes())
-                    .expect("Unexpected error while write in VecDeque.");
-            }
-            self.count += 1;
-            self
-        }
-    }
-} // mod h
-
-type Connections = Vec<Option<Connection>>;
-
-fn poll_1(events: &mut Events, conns: &mut Connections)
-    -> std::io::Result<()> {
-    POLL.with(|poll|
-        poll.borrow_mut().poll(events, None))?;
-    for event in &*events {
-        let Token(i) = event.token();
-        match conns.get_mut(i) {
-            Some(Some(ref mut conn)) => {
-                if !handle_event(conn, &event) {
-                    println!("Connection #{} is shut down.", i);
-                    if !conn.to_write.is_empty() {
-                        eprintln!("Pending {} bytes where not transmitted.",
-                                  conn.to_write.len());
-                    }
-                    drop(conns[i].take());
-                }
-            }
-            Some(None) => { println!("WARNING! Connection #{} is gone.", i); }
-            None => { panic!("Connection #{} not found.", i); }
-        }
-//        println!("Handled event. writable={}, readable={}",
-//            event.is_writable(), event.is_readable());
-    }
-    Ok(())
-}
-
-fn handle_event(conn: &mut Connection, event: &mio::event::Event) -> bool {
-    if event.is_readable() {
-        loop {
-            let mut buffer = [0u8; 2048];
-            match conn.stream.read(&mut buffer) {
-                Err(ref e) if e.kind() == ErrorKind::WouldBlock => break,
-                Ok(len) if len > 0 =>
-                    conn.handler.process(&buffer, len, &mut conn.to_write),
-                Ok(_) => return false,
-                Err(e) => {
-                    eprintln!("Error in connection: {}", e.to_string());
-                    return false
-                }
-            }
-        }
-    }
-    if event.is_writable() {
-        if let Err(e) = conn.write_if_pending() {
-            eprintln!("Error in connection: {}", e.to_string());
-            return false
-        };
-    }
-    true
-}
-
 use std::cell::RefCell;
 
 thread_local! {
@@ -183,11 +65,10 @@ thread_local! {
 
 fn main() -> Result<(), Box<dyn Error>> {
     let mut events = Events::with_capacity(128);
-
     let address: std::net::SocketAddr = "127.0.0.1:7878".parse()?;
-
     let mut conns = Vec::new();
-    new_connection(address, &mut conns,
+
+    let session_1 = new_session(address, Token(conns.len()),
 &br"echo name GREEN
 echo will sleep for 2 sec
 keepalive
@@ -197,15 +78,48 @@ echo Slept 2 sec
     .to_vec()
     )?;
 
-    new_connection(address,
-        &mut conns,
+    let future_1 = Box::pin(interaction_1(session_1));
+    conns.push(Some(future_1));
+
+    let session_2 = new_session(address, Token(conns.len()),
         &b"echo name RED\necho will sleep 5 sec\nsleep 5\necho Slept 5 sec\nkeepalive\n"
         .to_vec())?;
+    let future_2 = Box::pin(interaction_1(session_2));
+    conns.push(Some(future_2));
 
+    let mut waker_arc = Arc::new(DummyWaker);
+    let waker = waker_ref(&mut waker_arc);
+
+    let mut context = Context::from_waker(&*waker);
+
+    'outer:
     while conns.iter().find(|x|x.is_some()).is_some() {
-        if let Err(e) = poll_1(&mut events, &mut conns) {
+        if let Err(e) = POLL.with(|poll|
+            poll.borrow_mut().poll(&mut events, None)) {
             if e.kind() != ErrorKind::Interrupted {
                 panic!("Cannot poll selector: {}", e);
+            }
+        }
+
+        for event in &events {
+            let Token(i) = event.token();
+            match conns.get_mut(i) {
+                Some(Some(ref mut future) ) => {
+                    match future.as_mut().poll(&mut context) {
+                        Poll::Ready(Ok(())) => {
+                            drop(conns[i].take());
+                            println!("Session #{} is closed.", i);
+                        }
+                        Poll::Ready(Err(e)) => {
+                            println!("Error in session #{}: {}", i, e.to_string());
+                            break 'outer;
+                        }
+                        Poll::Pending => {}
+                    }
+
+                }
+                Some(None) => { println!("WARNING! Connection #{} is gone.", i); }
+                None => { panic!("Connection #{} not found.", i); }
             }
         }
     }
@@ -213,12 +127,17 @@ echo Slept 2 sec
     Ok(())
 }
 
-async fn interaction_1(conn: &mut Connection) -> io::Result<()> {
+async fn interaction_1(mut conn: Session) -> io::Result<()> {
     let mut buffer = [0u8; 2048];
     let mut name = "unnamed".to_string();
+    let mut write_is_pending = true;
 
     'outer:
     loop {
+        if write_is_pending {
+            write_is_pending = conn.write_if_pending()? == Poll::Pending;
+        }
+
         let len = conn.read(&mut buffer).await?;
         let buffer = String::from_utf8_lossy(&buffer[..len]);
         let mut it = buffer.lines();
@@ -228,8 +147,12 @@ async fn interaction_1(conn: &mut Connection) -> io::Result<()> {
         }
     }
 
+    let mut count = 1 as usize;
     loop {
-        let mut count = 1 as usize;
+        if write_is_pending {
+            write_is_pending = conn.write_if_pending()? == Poll::Pending;
+        }
+
         let len = conn.read(&mut buffer).await?;
         if len == 0 { break }
         let buffer = String::from_utf8_lossy(&buffer[..len]);
@@ -240,6 +163,7 @@ async fn interaction_1(conn: &mut Connection) -> io::Result<()> {
             if count == 2 {
                 let reply = format!("echo Hello from {} peer!\nexit\n", name);
                 conn.append_to_write(reply.as_bytes());
+                write_is_pending = true;
             }
             count += 1;
         }
@@ -248,23 +172,17 @@ async fn interaction_1(conn: &mut Connection) -> io::Result<()> {
     Ok(())
 }
 
-fn new_connection(addr: std::net::SocketAddr,
-                  conns: &mut Connections, to_send: &[u8])
-     -> io::Result<()> {
+fn new_session(addr: std::net::SocketAddr, token: Token, to_send: &[u8])
+     -> io::Result<Session> {
     let stream = net::TcpStream::connect(addr)?;
-    let mut conn =
-        Connection { to_write: VecDeque::new(), stream,
-                     handler: CommonHandler{ state: Some(Box::new(h::InitialHandler{})) }
-                   };
+    let mut conn = Session { to_write: VecDeque::new(), stream };
     conn.to_write.extend(to_send);
 
-    let token = Token(conns.len());
     POLL.with(|poll| poll.borrow_mut().registry()
         .register(&mut conn.stream, token, Interest::READABLE|Interest::WRITABLE)
     )?;
 
-    conns.push(Some(conn));
-    Ok(())
+    Ok(conn)
 }
 
 fn split_command(s: &str) -> (&str, &str) {
@@ -281,4 +199,15 @@ fn get_name(s: &str, name: &mut String) -> bool {
         }
         _ => false,
     }
+}
+
+#[derive(Clone)]
+struct DummyWaker;
+
+use std::sync::Arc;
+impl ArcWake for DummyWaker {
+    fn wake_by_ref(_arc_self: &Arc<Self>) {
+        unimplemented!();
+    }
+
 }
